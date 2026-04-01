@@ -95,6 +95,7 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://unpkg.com/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
 <script>
 'use strict';
 
@@ -336,29 +337,62 @@ mkBox(-4, -38.7, 0.6, 0.6, 0.6);
 mkBox(22, 5, 1.2, 0.8, 0.8);
 
 // ══════════════════════════════════════════════════════
-//  ENTITY (dark humanoid)
+//  ENTITY (GLB model)
 // ══════════════════════════════════════════════════════
 const entityGroup = new THREE.Group();
 scene.add(entityGroup);
-
-function ePart(w, h, d, x, y, z, mat) {
-  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat || MAT.entity);
-  m.position.set(x, y, z);
-  entityGroup.add(m);
-  return m;
-}
-
-const eTorso = ePart(0.62, 1.02, 0.30,  0.00, 1.36,  0.00);
-const eHead  = ePart(0.50, 0.52, 0.48,  0.00, 2.10,  0.00);
-const eLArm  = ePart(0.20, 0.88, 0.20, -0.43, 1.22,  0.00);
-const eRArm  = ePart(0.20, 0.88, 0.20,  0.43, 1.22,  0.00);
-const eLLeg  = ePart(0.24, 0.90, 0.24, -0.19, 0.45,  0.00);
-const eRLeg  = ePart(0.24, 0.90, 0.24,  0.19, 0.45,  0.00);
-// Glowing eyes
-ePart(0.10, 0.10, 0.08, -0.13, 2.12, 0.24, MAT.eye);
-ePart(0.10, 0.10, 0.08,  0.13, 2.12, 0.24, MAT.eye);
-
 entityGroup.position.set(4, 0, -40);
+
+// アニメーションミキサー
+let entityMixer = null;
+let entityLoaded = false;
+
+// ローディング表示
+const loadingEl = document.createElement('div');
+loadingEl.style.cssText = 'position:fixed;bottom:3em;left:50%;transform:translateX(-50%);color:rgba(255,255,255,.3);font-family:"Courier New",monospace;font-size:.7em;letter-spacing:.1em;z-index:20;pointer-events:none';
+loadingEl.textContent = 'LOADING...';
+document.body.appendChild(loadingEl);
+
+const loader = new THREE.GLTFLoader();
+loader.load(
+  'enemy.glb',
+  (gltf) => {
+    const model = gltf.scene;
+
+    // モデルのサイズを自動計測してスケール調整
+    const box = new THREE.Box3().setFromObject(model);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const targetHeight = 2.2; // 2.2m の高さに合わせる
+    const scale = targetHeight / size.y;
+    model.scale.setScalar(scale);
+
+    // 地面にぴったり置く
+    box.setFromObject(model);
+    model.position.y = -box.min.y * scale;
+
+    entityGroup.add(model);
+
+    // アニメーションがあれば再生
+    if (gltf.animations && gltf.animations.length > 0) {
+      entityMixer = new THREE.AnimationMixer(model);
+      const clip = gltf.animations[0];
+      const action = entityMixer.clipAction(clip);
+      action.play();
+    }
+
+    entityLoaded = true;
+    loadingEl.remove();
+  },
+  (xhr) => {
+    const pct = Math.round(xhr.loaded / xhr.total * 100);
+    loadingEl.textContent = `LOADING... ${pct}%`;
+  },
+  (err) => {
+    console.error('GLB load error:', err);
+    loadingEl.textContent = 'MODEL ERROR';
+  }
+);
 
 // ══════════════════════════════════════════════════════
 //  COLLISION
@@ -557,14 +591,16 @@ function animate() {
     }
   }
 
-  // Entity animation
-  const walkFreq = dist < CFG.E_DETECT ? 9.5 : 5.0;
-  const w = now * walkFreq;
-  eLArm.rotation.x =  Math.sin(w) * 0.5;
-  eRArm.rotation.x = -Math.sin(w) * 0.5;
-  eLLeg.rotation.x = -Math.sin(w) * 0.42;
-  eRLeg.rotation.x =  Math.sin(w) * 0.42;
-  entityGroup.position.y = Math.abs(Math.sin(w * 0.5)) * 0.04;
+  // Entity animation (GLBミキサー or フォールバックボブ)
+  if (entityMixer) {
+    const timeScale = dist < CFG.E_DETECT ? 1.6 : 0.9;
+    entityMixer.timeScale = timeScale;
+    entityMixer.update(dt);
+  } else {
+    // モデル読み込み前の簡易ボブ
+    const w = now * (dist < CFG.E_DETECT ? 9.5 : 5.0);
+    entityGroup.position.y = Math.abs(Math.sin(w * 0.5)) * 0.04;
+  }
 
   // ── Danger effects ───────────────────────────────
   const danger = dist < CFG.E_DETECT ? Math.max(0, 1 - dist / CFG.E_DETECT) : 0;
