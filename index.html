@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>B1F — 地下駐車場</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; font-family: 'Courier New', monospace; }
+    canvas { position: fixed; top: 0; left: 0; display: block; }
+
+    /* ── UI overlays ── */
+    [hidden] { display: none !important; }
+    .panel {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: rgba(0,0,0,.92); z-index: 50; color: #ccc;
+    }
+    .panel h1 { font-size: 2.8em; letter-spacing: .35em; color: #b0b0a8; margin-bottom: .3em; }
+    .panel .sub { color: #3a3a35; letter-spacing: .25em; font-size: .85em; margin: .4em 0; }
+    .panel .hint { color: #252520; font-size: .72em; margin-top: .4em; }
+    .btn {
+      margin-top: 1.8em; padding: .75em 2.6em;
+      background: transparent; border: 1px solid #3a3a35; color: #666;
+      font-family: 'Courier New', monospace; font-size: .95em;
+      cursor: pointer; letter-spacing: .18em; transition: all .25s;
+    }
+    .btn:hover { border-color: #888; color: #ccc; background: rgba(255,255,255,.04); }
+
+    /* ── In-game overlays ── */
+    #vignette {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      pointer-events: none; z-index: 10;
+      background: radial-gradient(ellipse at center, transparent 52%, rgba(0,0,0,.8) 100%);
+    }
+    #blood {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      pointer-events: none; z-index: 11; opacity: 0; transition: opacity .12s;
+      background: radial-gradient(ellipse at center, transparent 30%, rgba(55,0,0,.6) 100%);
+    }
+    #hud {
+      position: fixed; bottom: 1.2em; left: 50%; transform: translateX(-50%);
+      color: rgba(255,255,255,.2); font-size: .68em; letter-spacing: .1em;
+      pointer-events: none; z-index: 20;
+    }
+    #crosshair {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+      pointer-events: none; z-index: 20; width: 12px; height: 12px;
+    }
+    #crosshair::before, #crosshair::after {
+      content: ''; position: absolute; background: rgba(255,255,255,.32);
+    }
+    #crosshair::before { width: 1px; height: 12px; left: 50%; top: 0; transform: translateX(-50%); }
+    #crosshair::after  { width: 12px; height: 1px; top: 50%; left: 0; transform: translateY(-50%); }
+  </style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+<div id="vignette"></div>
+<div id="blood"></div>
+<div id="crosshair" hidden></div>
+<div id="hud" hidden>WASD : 移動 &nbsp;&nbsp; SHIFT : 走る &nbsp;&nbsp; マウス : 視点</div>
+
+<!-- START SCREEN -->
+<div class="panel" id="panel-start">
+  <h1>B1F</h1>
+  <p class="sub">— 地 下 駐 車 場 —</p>
+  <br>
+  <p style="color:#2e2e28;font-size:.82em;letter-spacing:.1em">何かがいる</p>
+  <button class="btn" id="btn-start">START</button>
+  <p class="hint">WASD 移動 / SHIFT 走る / マウス 視点</p>
+</div>
+
+<!-- GAMEOVER SCREEN -->
+<div class="panel" id="panel-over" hidden>
+  <h1 style="color:#700000">CAUGHT</h1>
+  <p class="sub" style="color:#3a1010;margin-top:.5em">捕まった</p>
+  <button class="btn" id="btn-retry" style="border-color:#3a0000;color:#600">RETRY</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+'use strict';
+
+// ══════════════════════════════════════════════════════
+//  CONFIG
+// ══════════════════════════════════════════════════════
+const CFG = {
+  GW: 54, GL: 90, GH: 3.1,        // garage Width / Length / Height
+  CSX: 6, CSZ: 9,                  // column spacing X / Z
+  PH: 1.7, PR: 0.4,                // player Height / Radius
+  PS: 4.6, PSP: 7.4,               // player Speed / Sprint speed
+  ER: 0.45,                        // entity radius
+  ES_WANDER: 2.2, ES_CHASE: 5.2,   // entity speed
+  E_DETECT: 32, E_KILL: 1.5,       // entity detect / kill distance
+};
+const HW = CFG.GW / 2, HL = CFG.GL / 2; // half-extents
+
+// ══════════════════════════════════════════════════════
+//  RENDERER / SCENE / CAMERA
+// ══════════════════════════════════════════════════════
+const renderer = new THREE.WebGLRenderer({
+  canvas: document.getElementById('c'),
+  antialias: false,
+  powerPreference: 'high-performance',
+});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x060606);
+scene.fog = new THREE.FogExp2(0x080808, 0.036);
+
+const camera = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, 0.1, 80);
+camera.rotation.order = 'YXZ';
+
+// ══════════════════════════════════════════════════════
+//  MATERIALS
+// ══════════════════════════════════════════════════════
+const MAT = {
+  floor:   new THREE.MeshLambertMaterial({ color: 0x545450 }),
+  ceiling: new THREE.MeshLambertMaterial({ color: 0x3c3c3a }),
+  wall:    new THREE.MeshLambertMaterial({ color: 0x444440 }),
+  col:     new THREE.MeshLambertMaterial({ color: 0x4c4c48 }),
+  entity:  new THREE.MeshLambertMaterial({ color: 0x070707 }),
+  eye:     new THREE.MeshBasicMaterial({ color: 0xffeecc }),
+  sign:    new THREE.MeshBasicMaterial({ color: 0xff2000 }),
+  line:    new THREE.MeshBasicMaterial({ color: 0xddddcc, transparent: true, opacity: 0.38 }),
+  lpanel:  new THREE.MeshBasicMaterial({ color: 0xfff8e0 }),
+  barrel:  new THREE.MeshLambertMaterial({ color: 0x1c1c16 }),
+  car: [
+    new THREE.MeshLambertMaterial({ color: 0x1e1e1c }),
+    new THREE.MeshLambertMaterial({ color: 0x1a1f26 }),
+    new THREE.MeshLambertMaterial({ color: 0x241818 }),
+    new THREE.MeshLambertMaterial({ color: 0x181818 }),
+    new THREE.MeshLambertMaterial({ color: 0x202018 }),
+  ],
+};
+
+// ══════════════════════════════════════════════════════
+//  LIGHTS
+// ══════════════════════════════════════════════════════
+scene.add(new THREE.AmbientLight(0x181818, 1.2));
+
+const flickerList = []; // { pl, panel, base, t }
+
+function mkCeilingLight(x, z) {
+  if (Math.random() < 0.13) return; // dead
+  const flicker = Math.random() < 0.22;
+  const base = 0.65 + Math.random() * 0.5;
+  const pl = new THREE.PointLight(0xfff3c0, base, 12);
+  pl.position.set(x, CFG.GH - 0.08, z);
+  scene.add(pl);
+
+  const panelMat = MAT.lpanel.clone();
+  const panel = new THREE.Mesh(new THREE.PlaneGeometry(0.22, 1.05), panelMat);
+  panel.rotation.x = Math.PI / 2;
+  panel.position.set(x, CFG.GH - 0.01, z);
+  scene.add(panel);
+
+  if (flicker) flickerList.push({ pl, panel, panelMat, base, t: Math.random() * 0.5 });
+}
+
+// ══════════════════════════════════════════════════════
+//  GARAGE SHELL
+// ══════════════════════════════════════════════════════
+// Floor
+const floorMesh = new THREE.Mesh(new THREE.PlaneGeometry(CFG.GW, CFG.GL), MAT.floor);
+floorMesh.rotation.x = -Math.PI / 2;
+scene.add(floorMesh);
+
+// Ceiling
+const ceilMesh = new THREE.Mesh(new THREE.PlaneGeometry(CFG.GW, CFG.GL), MAT.ceiling);
+ceilMesh.rotation.x = Math.PI / 2;
+ceilMesh.position.y = CFG.GH;
+scene.add(ceilMesh);
+
+// Walls (4 sides)
+function mkWall(w, h, d, x, z) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), MAT.wall);
+  m.position.set(x, h / 2, z);
+  scene.add(m);
+}
+mkWall(CFG.GW, CFG.GH, 0.22, 0, -HL);
+mkWall(CFG.GW, CFG.GH, 0.22, 0,  HL);
+mkWall(0.22, CFG.GH, CFG.GL, -HW, 0);
+mkWall(0.22, CFG.GH, CFG.GL,  HW, 0);
+
+// ══════════════════════════════════════════════════════
+//  COLUMNS + LIGHTS
+// ══════════════════════════════════════════════════════
+const colBoxes = []; // AABB obstacles { cx, cz, r }
+
+const nColsX = Math.round(CFG.GW / CFG.CSX) - 1;
+const nColsZ = Math.round(CFG.GL / CFG.CSZ) - 1;
+
+for (let ix = 0; ix < nColsX; ix++) {
+  for (let iz = 0; iz < nColsZ; iz++) {
+    const x = -HW + CFG.CSX + ix * CFG.CSX;
+    const z = -HL + CFG.CSZ + iz * CFG.CSZ;
+
+    const col = new THREE.Mesh(new THREE.BoxGeometry(0.5, CFG.GH, 0.5), MAT.col);
+    col.position.set(x, CFG.GH / 2, z);
+    scene.add(col);
+    colBoxes.push({ cx: x, cz: z, r: 0.5 });
+
+    // Light mid-cell
+    if (ix < nColsX - 1) {
+      mkCeilingLight(x + CFG.CSX * 0.5, z + CFG.CSZ * 0.5);
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  EXIT SIGNS (near player start, +Z wall)
+// ══════════════════════════════════════════════════════
+function mkExitSign(x) {
+  const sign = new THREE.Mesh(new THREE.PlaneGeometry(0.55, 0.22), MAT.sign);
+  sign.position.set(x, 2.75, HL - 0.15);
+  scene.add(sign);
+  const sl = new THREE.PointLight(0xff2200, 0.35, 3.5);
+  sl.position.set(x, 2.75, HL - 0.25);
+  scene.add(sl);
+}
+mkExitSign(-5); mkExitSign(5);
+
+// ══════════════════════════════════════════════════════
+//  CARS
+// ══════════════════════════════════════════════════════
+const carBoxes = []; // { cx, cz, hw, hl }
+
+function mkCar(x, z, facingX) {
+  // facingX = true  → car points along X (parked nose/tail in X direction)
+  //           false → parked along Z
+  const CW = 1.85, CH = 1.38, CL = 4.25;
+  const mat = MAT.car[Math.floor(Math.random() * MAT.car.length)];
+
+  const body = new THREE.Mesh(new THREE.BoxGeometry(CW, CH, CL), mat);
+  body.position.set(x, CH / 2, z);
+  if (facingX) body.rotation.y = Math.PI / 2;
+  scene.add(body);
+
+  // Glass — slightly raised, angled windshield look
+  const glassMat = new THREE.MeshLambertMaterial({ color: 0x080c10, transparent: true, opacity: 0.75 });
+  const glass = new THREE.Mesh(new THREE.PlaneGeometry(CW * 0.78, CH * 0.42), glassMat);
+  glass.position.set(0, CH * 0.18, -CL * 0.47);
+  glass.rotation.x = -0.28;
+  body.add(glass);
+
+  // AABB (approximate, axis-aligned)
+  const hw = (facingX ? CL : CW) / 2 + 0.22;
+  const hl = (facingX ? CW : CL) / 2 + 0.22;
+  carBoxes.push({ cx: x, cz: z, hw, hl });
+}
+
+// Parking rows: stall width = 2.5m, stall depth = 5m
+// Rows come in pairs facing each other, separated by a driving lane
+const STALL_W = 2.5;
+const rowPairZs = [[-38, -32], [-22, -16], [-6, 0], [10, 16], [24, 30]];
+
+for (const [zA, zB] of rowPairZs) {
+  for (let c = 0; c < 11; c++) {
+    const x = -HW + 2.5 + c * STALL_W;
+    if (x > HW - 1.8) break;
+    if (Math.random() < 0.58) mkCar(x, zA + 2.5, false);
+    if (Math.random() < 0.58) mkCar(x, zB - 2.5, false);
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  PARKING LINES
+// ══════════════════════════════════════════════════════
+function mkLine(x, z, len, vert) {
+  const geo = vert
+    ? new THREE.PlaneGeometry(0.05, len)
+    : new THREE.PlaneGeometry(len, 0.05);
+  const m = new THREE.Mesh(geo, MAT.line);
+  m.rotation.x = -Math.PI / 2;
+  m.position.set(x, 0.01, z);
+  scene.add(m);
+}
+
+for (const [zA, zB] of rowPairZs) {
+  for (let c = 0; c <= 11; c++) {
+    const x = -HW + 2.5 + c * STALL_W;
+    if (x > HW - 1.5) break;
+    mkLine(x, zA + 2.5, 5.0, true);
+    mkLine(x, zB - 2.5, 5.0, true);
+  }
+  mkLine(0, zA,       CFG.GW - 4, false);
+  mkLine(0, zA + 5.0, CFG.GW - 4, false);
+  mkLine(0, zB - 5.0, CFG.GW - 4, false);
+  mkLine(0, zB,       CFG.GW - 4, false);
+}
+
+// ══════════════════════════════════════════════════════
+//  ATMOSPHERIC PROPS (barrels, boxes)
+// ══════════════════════════════════════════════════════
+function mkBarrel(x, z) {
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.24, 0.85, 8), MAT.barrel);
+  m.position.set(x, 0.425, z);
+  scene.add(m);
+  colBoxes.push({ cx: x, cz: z, r: 0.44 });
+}
+function mkBox(x, z, w, h, d) {
+  const m = new THREE.Mesh(
+    new THREE.BoxGeometry(w, h, d),
+    new THREE.MeshLambertMaterial({ color: 0x1a1510 })
+  );
+  m.position.set(x, h / 2, z);
+  scene.add(m);
+  colBoxes.push({ cx: x, cz: z, r: Math.max(w, d) / 2 + 0.1 });
+}
+
+mkBarrel(-20, 8); mkBarrel(-20.6, 9.0); mkBarrel(-21, 7.8);
+mkBarrel(18, -18); mkBarrel(18.5, -19);
+mkBox(-4, -38, 0.6, 0.6, 0.6);
+mkBox(-4.7, -38, 0.6, 0.6, 0.6);
+mkBox(-4, -38.7, 0.6, 0.6, 0.6);
+mkBox(22, 5, 1.2, 0.8, 0.8);
+
+// ══════════════════════════════════════════════════════
+//  ENTITY (dark humanoid)
+// ══════════════════════════════════════════════════════
+const entityGroup = new THREE.Group();
+scene.add(entityGroup);
+
+function ePart(w, h, d, x, y, z, mat) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat || MAT.entity);
+  m.position.set(x, y, z);
+  entityGroup.add(m);
+  return m;
+}
+
+const eTorso = ePart(0.62, 1.02, 0.30,  0.00, 1.36,  0.00);
+const eHead  = ePart(0.50, 0.52, 0.48,  0.00, 2.10,  0.00);
+const eLArm  = ePart(0.20, 0.88, 0.20, -0.43, 1.22,  0.00);
+const eRArm  = ePart(0.20, 0.88, 0.20,  0.43, 1.22,  0.00);
+const eLLeg  = ePart(0.24, 0.90, 0.24, -0.19, 0.45,  0.00);
+const eRLeg  = ePart(0.24, 0.90, 0.24,  0.19, 0.45,  0.00);
+// Glowing eyes
+ePart(0.10, 0.10, 0.08, -0.13, 2.12, 0.24, MAT.eye);
+ePart(0.10, 0.10, 0.08,  0.13, 2.12, 0.24, MAT.eye);
+
+entityGroup.position.set(4, 0, -40);
+
+// ══════════════════════════════════════════════════════
+//  COLLISION
+// ══════════════════════════════════════════════════════
+function collides(nx, nz, radius) {
+  // Perimeter walls
+  if (nx < -HW + 0.22 + radius || nx > HW - 0.22 - radius) return true;
+  if (nz < -HL + 0.22 + radius || nz > HL - 0.22 - radius) return true;
+  // Columns + props
+  for (const c of colBoxes) {
+    if (Math.abs(nx - c.cx) < c.r + radius && Math.abs(nz - c.cz) < c.r + radius) return true;
+  }
+  // Cars
+  for (const b of carBoxes) {
+    if (Math.abs(nx - b.cx) < b.hw + radius && Math.abs(nz - b.cz) < b.hl + radius) return true;
+  }
+  return false;
+}
+
+// Entity collision (walls + columns only — not cars, feels more supernatural)
+function entityCollides(nx, nz) {
+  if (nx < -HW + 0.22 + CFG.ER || nx > HW - 0.22 - CFG.ER) return true;
+  if (nz < -HL + 0.22 + CFG.ER || nz > HL - 0.22 - CFG.ER) return true;
+  for (const c of colBoxes) {
+    if (Math.abs(nx - c.cx) < c.r + CFG.ER && Math.abs(nz - c.cz) < c.r + CFG.ER) return true;
+  }
+  return false;
+}
+
+// ══════════════════════════════════════════════════════
+//  AUDIO (Web Audio API)
+// ══════════════════════════════════════════════════════
+let actx = null, lastHB = 0;
+
+function initAudio() {
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+
+  // Low-frequency drone ambience
+  const o1 = actx.createOscillator();
+  const o2 = actx.createOscillator();
+  const filt = actx.createBiquadFilter();
+  const gain = actx.createGain();
+
+  o1.type = 'sawtooth'; o1.frequency.value = 54.5;
+  o2.type = 'sine';     o2.frequency.value = 57.3;
+  filt.type = 'lowpass'; filt.frequency.value = 160;
+  gain.gain.value = 0.022;
+
+  o1.connect(filt); o2.connect(filt);
+  filt.connect(gain); gain.connect(actx.destination);
+  o1.start(); o2.start();
+}
+
+function playHeartbeat(vol) {
+  if (!actx) return;
+  const now = actx.currentTime;
+  const osc = actx.createOscillator();
+  const g = actx.createGain();
+  osc.type = 'sine'; osc.frequency.value = 72;
+  g.gain.setValueAtTime(0, now);
+  g.gain.linearRampToValueAtTime(vol * 0.32, now + 0.04);
+  g.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+  osc.connect(g); g.connect(actx.destination);
+  osc.start(now); osc.stop(now + 0.32);
+}
+
+function playFootstep() {
+  if (!actx) return;
+  const now = actx.currentTime;
+  const buf = actx.createBuffer(1, actx.sampleRate * 0.12, actx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+  const src = actx.createBufferSource();
+  src.buffer = buf;
+  const filt = actx.createBiquadFilter();
+  filt.type = 'bandpass'; filt.frequency.value = 180; filt.Q.value = 0.8;
+  const g = actx.createGain();
+  g.gain.value = 0.08;
+  src.connect(filt); filt.connect(g); g.connect(actx.destination);
+  src.start(now);
+}
+
+// ══════════════════════════════════════════════════════
+//  INPUT & POINTER LOCK
+// ══════════════════════════════════════════════════════
+const keys = {};
+let yaw = 0, pitch = 0;
+
+document.getElementById('c').addEventListener('click', () => {
+  if (gameRunning && !gameOver) document.getElementById('c').requestPointerLock();
+});
+document.addEventListener('mousemove', e => {
+  if (!document.pointerLockElement || !gameRunning || gameOver) return;
+  yaw   -= e.movementX * 0.0024;
+  pitch -= e.movementY * 0.0024;
+  pitch = Math.max(-1.05, Math.min(1.05, pitch));
+});
+document.addEventListener('keydown', e => { keys[e.code] = true; });
+document.addEventListener('keyup',   e => { keys[e.code] = false; });
+
+// ══════════════════════════════════════════════════════
+//  STATE
+// ══════════════════════════════════════════════════════
+let gameRunning = false, gameOver = false;
+const clock = new THREE.Clock();
+
+// Head-bob
+let bobPhase = 0, bobDir = 1;
+// Footstep rhythm
+let stepTimer = 0;
+
+// ══════════════════════════════════════════════════════
+//  MAIN LOOP
+// ══════════════════════════════════════════════════════
+const bloodEl  = document.getElementById('blood');
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  if (!gameRunning || gameOver) {
+    renderer.render(scene, camera);
+    return;
+  }
+
+  const dt  = Math.min(clock.getDelta(), 0.05);
+  const now = clock.elapsedTime;
+
+  // ── Player movement ──────────────────────────────
+  const sprint = keys['ShiftLeft'] || keys['ShiftRight'];
+  const speed  = sprint ? CFG.PSP : CFG.PS;
+
+  let mx = 0, mz = 0;
+  if (keys['KeyW'] || keys['ArrowUp'])    mz -= 1;
+  if (keys['KeyS'] || keys['ArrowDown'])  mz += 1;
+  if (keys['KeyA'] || keys['ArrowLeft'])  mx -= 1;
+  if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+
+  const moving = mx !== 0 || mz !== 0;
+  if (moving) {
+    const len = Math.hypot(mx, mz);
+    mx /= len; mz /= len;
+    const cos = Math.cos(yaw), sin = Math.sin(yaw);
+    const wx = mx * cos - mz * sin;
+    const wz = mx * sin + mz * cos;
+
+    const px = camera.position.x, pz = camera.position.z;
+    const nx = px + wx * speed * dt;
+    const nz = pz + wz * speed * dt;
+    if (!collides(nx, pz, CFG.PR)) camera.position.x = nx;
+    if (!collides(camera.position.x, nz, CFG.PR)) camera.position.z = nz;
+
+    // Head bob
+    const bobSpeed = sprint ? 16 : 10;
+    bobPhase += dt * bobSpeed * bobDir;
+    if (Math.abs(bobPhase) > 0.9) bobDir *= -1;
+
+    // Footstep sound
+    const stepInterval = sprint ? 0.28 : 0.44;
+    stepTimer -= dt;
+    if (stepTimer <= 0) { playFootstep(); stepTimer = stepInterval; }
+  } else {
+    bobPhase *= 0.88; // dampen
+    stepTimer = 0;
+  }
+
+  camera.position.y = CFG.PH + Math.sin(bobPhase) * 0.022;
+  camera.rotation.y = yaw;
+  camera.rotation.x = pitch + Math.sin(bobPhase * 0.5) * 0.008;
+
+  // ── Entity ───────────────────────────────────────
+  const ex = entityGroup.position.x;
+  const ez = entityGroup.position.z;
+  const px = camera.position.x;
+  const pz = camera.position.z;
+  const dx = px - ex, dz = pz - ez;
+  const dist = Math.hypot(dx, dz);
+
+  // Face player
+  entityGroup.rotation.y = Math.atan2(dx, dz);
+
+  // Speed (always chasing, faster when close)
+  const eSpeed = dist < CFG.E_DETECT ? CFG.ES_CHASE : CFG.ES_WANDER;
+
+  if (dist > 0.2) {
+    const ndx = dx / dist, ndz = dz / dist;
+    const nx = ex + ndx * eSpeed * dt;
+    const nz = ez + ndz * eSpeed * dt;
+    // Slide collision
+    if (!entityCollides(nx, nz)) {
+      entityGroup.position.x = nx;
+      entityGroup.position.z = nz;
+    } else if (!entityCollides(nx, ez)) {
+      entityGroup.position.x = nx;
+    } else if (!entityCollides(ex, nz)) {
+      entityGroup.position.z = nz;
+    }
+  }
+
+  // Entity animation
+  const walkFreq = dist < CFG.E_DETECT ? 9.5 : 5.0;
+  const w = now * walkFreq;
+  eLArm.rotation.x =  Math.sin(w) * 0.5;
+  eRArm.rotation.x = -Math.sin(w) * 0.5;
+  eLLeg.rotation.x = -Math.sin(w) * 0.42;
+  eRLeg.rotation.x =  Math.sin(w) * 0.42;
+  entityGroup.position.y = Math.abs(Math.sin(w * 0.5)) * 0.04;
+
+  // ── Danger effects ───────────────────────────────
+  const danger = dist < CFG.E_DETECT ? Math.max(0, 1 - dist / CFG.E_DETECT) : 0;
+  bloodEl.style.opacity = (danger * 0.6).toFixed(3);
+
+  if (danger > 0.05 && now - lastHB > Math.max(0.22, 0.88 - danger * 0.65)) {
+    playHeartbeat(danger);
+    lastHB = now;
+  }
+
+  // ── Flickering lights ────────────────────────────
+  for (const fl of flickerList) {
+    fl.t -= dt;
+    if (fl.t <= 0) {
+      const on = Math.random() > 0.32;
+      fl.pl.intensity = on ? fl.base : 0;
+      fl.panelMat.color.setHex(on ? 0xfff8e0 : 0x0c0c08);
+      fl.t = on ? 0.08 + Math.random() * 0.55 : 0.04 + Math.random() * 0.14;
+    }
+  }
+
+  // ── Game over ────────────────────────────────────
+  if (dist < CFG.E_KILL) {
+    gameOver = true;
+    document.exitPointerLock();
+    document.getElementById('panel-over').hidden  = false;
+    document.getElementById('crosshair').hidden   = true;
+    document.getElementById('hud').hidden         = true;
+  }
+
+  renderer.render(scene, camera);
+}
+
+// ══════════════════════════════════════════════════════
+//  START / RETRY
+// ══════════════════════════════════════════════════════
+function startGame() {
+  document.getElementById('panel-start').hidden = true;
+  document.getElementById('crosshair').hidden   = false;
+  document.getElementById('hud').hidden         = false;
+
+  camera.position.set(0, CFG.PH, HL - 5);
+  yaw = 0; pitch = 0;
+
+  gameRunning = true;
+  gameOver    = false;
+
+  initAudio();
+  clock.start();
+
+  document.getElementById('c').requestPointerLock();
+}
+
+document.getElementById('btn-start').addEventListener('click', startGame);
+document.getElementById('btn-retry').addEventListener('click', () => location.reload());
+
+// ══════════════════════════════════════════════════════
+//  RESIZE
+// ══════════════════════════════════════════════════════
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// Kick off render loop
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>
